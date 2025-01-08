@@ -1,5 +1,6 @@
 from abc import abstractmethod
 import asyncio
+import os
 import socketio
 from picamera2 import Picamera2
 import time
@@ -20,21 +21,27 @@ import serial
 STUN_SERVER="stun:stun.l.google.com:19302"
 SIGNAL_SERVER="wss://robortc.el.r.appspot.com/"
 COMMAND_CHANNEL ="commands"
+COMMAND_SERIAL_REQUEST="HEY!!!"
 
 class PiCameraTrack(MediaStreamTrack):
     kind = "video"
-    cam = Picamera2()
+    cam = None
     def __init__(self):
         super().__init__()
-        
-        cam_config =self.cam.create_video_configuration( {"size":(640,480)},controls={"FrameRate": 15})
-        self.cam.configure(cam_config)
-        self.cam.start()
+        try:
+            self.cam =Picamera2()
+            cam_config =self.cam.create_video_configuration( {"size":(640,480)},controls={"FrameRate": 30})
+            self.cam.configure(cam_config)
+            self.cam.start()
+        except Exception as e:
+            print(f"Camera exception {e}")
 
     def startToCapture(self):
-        self.cam.start()
+        if None != self.cam:
+            self.cam.start()
     def stopCapture(self):
-        self.cam.stop
+        if None != self.cam:
+            self.cam.stop
 
     async def recv(self) -> Union[Frame, Packet]:
       
@@ -60,8 +67,6 @@ class Signal:
     def initConnection(self):pass
     @abstractmethod
     def emit(self, event , data):pass
-
-
 
 class SocketIOSignal(Signal):
     sioDomain:str =""
@@ -123,14 +128,81 @@ class SocketIOSignal(Signal):
     def setOnListenData(self, onData):
         self.onData = onData
 
-   
+class SerialCommunication():
+    def __init__(self,nameToSearch,portPrefix):
+        self.deviceName =nameToSearch
+        self.deviceType=portPrefix
+
+        self.maxErrorRetry=10
+        self.serialPort:serial=None#/dev/ttyACM
+        self.portname=None
+
+        self.scanAndGetSerialPort()
+        
+        if None == self.portname:
+            return 
+        self.serialPort = serial.Serial(self.portname, 9600, write_timeout=2, 
+                    parity=serial.PARITY_NONE, 
+                    bytesize=serial.EIGHTBITS, 
+                    stopbits=serial.STOPBITS_ONE)
+        self.serialPort.flush()
+
+    def scanAndGetSerialPort(self):
+        for i in range(0,255):
+            port =f"{self.deviceType}{i}"
+            if os.path.exists(port):   
+                with serial.Serial(port,9600, timeout=2) as ser:
+                    try:
+                        print(f"Port {port} is available and can be opened.")
+                        
+                        start_time = time.time()
+                        while True:
+                            ser.write(f"<{COMMAND_SERIAL_REQUEST}>" .encode('ascii'))
+                            line = ser.readline().decode('ascii').strip()
+                            print(f"---> {line}")
+                            if line == self.deviceName:
+                                print(f"got you {line}")
+                                self.portname = port
+                                break
+
+                            if time.time() - start_time > 5:
+                                print("Timeout: No response received.")
+                                break
+                    except serial.SerialException as e:
+                        print(f" {port} not found ${e}")
+                        pass
+        
+
+    def writeData(self,message):
+        if None == self.serialPort:
+            print("No serial port")
+            return 
+        print(f"send: {message}")
+
+        try:
+            if 0>= self.maxErrorRetry:
+                self.reconnect()
+
+            self.serialPort.write( f"<{message}>".encode('ascii'))
+            self.serialPort.flush()
+        except  serial.SerialException as e:
+            self.maxErrorRetry =self.maxErrorRetry-1
+            print(f"serial exception{e}")
+
+    def reconnect(self):
+        self.maxErrorRetry=10
+        self.scanAndGetSerialPort()
+        
+
 class RobotRTC:
     signal : Signal =None
-    def __init__(self,signal :Signal,cameraVideo:PiCameraTrack,serialCommunication:serial):
+    def __init__(self,signal :Signal,cameraVideo:PiCameraTrack,serialCommunication:SerialCommunication,serialCommunicationHead:SerialCommunication):
+   # def __init__(self,signal :Signal,cameraVideo:PiCameraTrack,serialCommunication:SerialCommunication,serialCommunicationHead:serial):
         self.signal =signal
         self.cameraVideo =cameraVideo
         self.audio = None
         self.serialCommunication =serialCommunication
+        self.serialCommunicationHead =serialCommunicationHead
         self.rtcConfig =RTCConfiguration(iceServers=[RTCIceServer(urls=STUN_SERVER)
                                         # ,RTCIceServer(urls= "turn:openrelay.mextered.ca:443"
                                         #               ,username ="openrelayproject"
@@ -147,9 +219,6 @@ class RobotRTC:
         self.deltaTime=0
         self.numberOfCommandAllowPersecond =5
         self.cps =1000.0/self.numberOfCommandAllowPersecond # 10 comand /1000 ms 
-       
-       
-
     
         signal.setOnListenConnected( lambda : {
              print("RoboRTC connected")
@@ -195,8 +264,19 @@ class RobotRTC:
             print("Error on data channel: %s", error)
 
         @self.dataChannel.on("message")
-        def on_message(message):        
+        async def on_message(message):     
+
             while True:
+
+                x=0.0
+                y=0.0
+                r=1.0
+                joystick ="LEFT"
+                try:
+                    data = json.loads(message)
+                    joystick =data['joystick']
+                except json.JSONDecodeError as e:
+                    print("Invalid JSON:", e)
 
                 self.deltaTime = int(time.time()*1000) - self.timeStamp
                 if self.deltaTime >= self.cps:
@@ -207,32 +287,26 @@ class RobotRTC:
                 else:
                     try:
                         #{"joystick":"LEFT","x":0.0,"y":0.0}
-                        data = json.loads(message)
-                        x=data['x']
-                        y=data['y']
-                        if x!=0.0 or y!=0.0:
-                            # this is not the termial message #{"joystick":"LEFT","x":0.0,"y":0.0}#
-                            break      
-                        # else:
-                        #     print("-------keep---------" )
+                        if "LEFT" == joystick:
+                            x=data['x']
+                            y=data['y']
+                            if x!=0.0 or y!=0.0:
+                                # this is not the termial message #{"joystick":"LEFT","x":0.0,"y":0.0}#
+                                break      
+                            # else:
+                            #     print("-------keep---------" )
+                        elif "RIGHT" == joystick:
+                            break    
                     except json.JSONDecodeError as e:
                         print("Invalid JSON:", e)
             
-                try:
-                    data = json.loads(message)
-                    x=data['x']
-                    y=data['y']
-                    radian =-1*math.atan2(y,x)
-                    debugCommandMessge(radian)
-
-                except json.JSONDecodeError as e:
-                    print("Invalid JSON:", e)
-
-                if None != self.serialCommunication:
-                    self.serialCommunication.write( f"<{message}>".encode('ascii'))
-                    self.serialCommunication.flush()
-                else:
-                    print("No Arduino device")
+                if "LEFT" == joystick :
+                    debugCommandMessge(message,True)
+                    await sendDataToSerial(self.serialCommunication,message)
+                    break
+                if "RIGHT" == joystick :
+                    await sendDataToSerial(self.serialCommunicationHead,message)
+                    break
 
                 break
 
@@ -290,79 +364,126 @@ class RobotRTC:
         await self.peerConnection.close()
         self.peerReady =False
 
-def debugCommandMessge(rawArcRadian, isShow :bool=False):
-    if not isShow:
-        return
-        
-    exceptArc =math.pi/8
-    joystickRadian =rawArcRadian
-    print("Radian: ",joystickRadian )
-    print("Radian upper : ", math.pi - exceptArc  )
-    print("Radian lower : ",    -1* math.pi + exceptArc  )
-    while True:
-        
-        if (rawArcRadian < exceptArc) and (rawArcRadian> -1 * exceptArc):
-            joystickRadian =0
-            print("0pi-------------------")
-            break
-        
-        if (rawArcRadian > math.pi/2 - exceptArc) and (rawArcRadian < math.pi/2 + exceptArc):
-            joystickRadian= math.pi/2
-            print("pi/2------------------")
-            break
+async def sendDataToSerialRaw(serialPort:serial,message):
+    if None == serialPort:
+        print("No serial port")
+        return 
+    print(f"send: {message}")
+    try:
 
-        if (rawArcRadian > math.pi - exceptArc  and rawArcRadian < math.pi) or (rawArcRadian < -1* math.pi + exceptArc and rawArcRadian>-1* math.pi):
-            joystickRadian = math.pi
-            print("pi ------------")
-            break
+        serialPort.write( f"<{message}>".encode('ascii'))
+        serialPort.flush()
+    except  serial.SerialException as e:
+        print(f"serial exception{e}")
 
-        if( rawArcRadian < -1 * math.pi/2 + exceptArc) and (rawArcRadian > -1 * math.pi/2 - exceptArc):
-            joystickRadian = -1* math.pi/2
-            print("-pi ----------------")
-            break
-        break
-    
-    
-    backAndForth = math.sin(joystickRadian)
-    leftAndRight = math.cos(joystickRadian)
-    print("cos:",leftAndRight)
-    print("sin:",backAndForth)
-    forward =1
-    if backAndForth <0:
-        forward=0
-        backAndForth=-backAndForth
-
-    right =1
-    if leftAndRight <0 :
-        right=0
-        leftAndRight=-leftAndRight
-    
-    
-
-    moveForwad = 255 * forward * backAndForth
-    moveBackward = 255* (1-forward) * backAndForth
-
-    moveRight =255 * right * leftAndRight
-    moveLeft = 255 *(1-right) * leftAndRight
-    
-    print(f"F:{moveForwad:.1f} B:{moveBackward:.1f} R:{moveRight:.1f} L{moveLeft:.1f}")
-
-   
-
-if __name__ =="__main__":
+async def sendDataToSerial(serialPort:SerialCommunication,message):
+    if None == serialPort:
+        print("No serial port")
+        return 
+    print(f"send: {message}")
 
     try:
-        serialChannel = serial.Serial('/dev/ttyUSB0', 9600, timeout=2, 
-                    parity=serial.PARITY_NONE, 
-                    bytesize=serial.EIGHTBITS, 
-                    stopbits=serial.STOPBITS_ONE)
-        serialChannel.flush()
+        serialPort.serialPort.write( f"<{message}>".encode('ascii'))
+        serialPort.serialPort.flush()
+    except  serial.SerialException as e:
+        print(f"serial exception{e}")
+
+
+
+def debugCommandMessge(message, isShow :bool=False):
+    
+    exceptArc =math.pi/8
+
+    if not isShow:
+        return
+    try:
+        data = json.loads(message)
+        x=data['x']
+        y=data['y']
+        r=data['r']       
+        x_y_length=math.sqrt(x**2 + y**2)
+        speedRatio =x_y_length/r
+        rawArcRadian =-1*math.atan2(y,x)
+ 
+
+        while True:
+            
+            if (rawArcRadian < exceptArc) and (rawArcRadian> -1 * exceptArc):
+                rawArcRadian =0
+                print("0pi-------------------")
+                break
+            
+            if (rawArcRadian > math.pi/2 - exceptArc) and (rawArcRadian < math.pi/2 + exceptArc):
+                rawArcRadian= math.pi/2
+                print("pi/2------------------")
+                break
+
+            if (rawArcRadian > math.pi - exceptArc  and rawArcRadian < math.pi) or (rawArcRadian < -1* math.pi + exceptArc and rawArcRadian>-1* math.pi):
+                rawArcRadian = math.pi
+                print("pi ------------")
+                break
+
+            if( rawArcRadian < -1 * math.pi/2 + exceptArc) and (rawArcRadian > -1 * math.pi/2 - exceptArc):
+                rawArcRadian = -1* math.pi/2
+                print("-pi ----------------")
+                break
+            break
+        
+        
+        backAndForth = math.sin(rawArcRadian)
+        leftAndRight = math.cos(rawArcRadian)
+        print("cos:",leftAndRight)
+        print("sin:",backAndForth)
+        forward =1
+        if backAndForth <0:
+            forward=0
+            backAndForth=-backAndForth
+
+        right =1
+        if leftAndRight <0 :
+            right=0
+            leftAndRight=-leftAndRight
+        
+        
+        moveForwad = speedRatio * 255 * forward * backAndForth
+        moveBackward = speedRatio* 255* (1-forward) * backAndForth
+
+        moveRight =speedRatio * 255 * right * leftAndRight
+        moveLeft =speedRatio*  255 *(1-right) * leftAndRight
+        
+        print(f"F:{moveForwad:.1f} B:{moveBackward:.1f} R:{moveRight:.1f} L{moveLeft:.1f}")
+
+        
+    except json.JSONDecodeError as e:
+        print("Invalid JSON:", e)
+    
+serialChannelBody =None
+serialChannelHead=None
+if __name__ =="__main__":
+    try:
+        # serialChannelBody = serial.Serial('/dev/ttyUSB1', 9600, write_timeout=0, 
+        #             parity=serial.PARITY_NONE, 
+        #             bytesize=serial.EIGHTBITS, 
+        #             stopbits=serial.STOPBITS_ONE)
+        # serialChannelBody.flush()
+        serialChannelBody =SerialCommunication("BODY","/dev/ttyUSB")
+
     except:
-        print("USB not found")
+        print("USB Body nottttt found")
+    try:
+        serialChannelHead =SerialCommunication("HEAD","/dev/ttyUSB")
+
+        # serialChannelHead = serial.Serial('/dev/ttyACM1', 9600, write_timeout=0, 
+        #             parity=serial.PARITY_NONE, 
+        #             bytesize=serial.EIGHTBITS, 
+        #             stopbits=serial.STOPBITS_ONE)
+        # serialChannelBody.flush()    
+    except:
+        print("USB Head Nottttttt found")
 
     socketioSignal =SocketIOSignal(sioDomain=SIGNAL_SERVER,room="123",username="raspberry")
 
-    robotRTC = RobotRTC(signal=socketioSignal,cameraVideo=PiCameraTrack(),serialCommunication=serialChannel)
+    robotRTC = RobotRTC(signal=socketioSignal,cameraVideo=PiCameraTrack(),serialCommunication=serialChannelBody,serialCommunicationHead=serialChannelHead)
 
     asyncio.run(robotRTC.start())
 
